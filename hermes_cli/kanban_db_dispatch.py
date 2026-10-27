@@ -923,11 +923,69 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     return reconciled
 
 
-def _error_fingerprint(error_text: str) -> str:
-    """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group."""
-    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
-    fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
-    return fp.lower().strip()
+# A crash label synthesized from the exit status alone: "pid N exited with code 1",
+# "pid N killed by signal 9", "pid N not alive". The status is the only thing it
+# says — the cause lives in the worker's own last output, appended to the same
+# string by ``_classify_dead_worker``.
+_SYNTHETIC_CRASH_RE = re.compile(
+    r'^pid \d+ (?:exited with code -?\d+|killed by signal -?\d+|not alive)\b', re.IGNORECASE,
+)
+# The whole cause line, up to the bound ``_worker_final_output`` itself applies:
+# a fixed prefix window would let shared harness boilerplate ("Kanban owner
+# refused: Gateway disconnected; turn outcome is unknown. …") eat the budget and
+# hide the part that actually distinguishes two causes.
+_CAUSE_CLASS_CHARS = 400
+
+
+def _normalise_cause_line(line: str) -> str:
+    """Strip the volatile bits of one worker line so one cause keeps one bucket."""
+    s = re.sub(r'\bpid \d+\b', 'pid N', line)
+    s = re.sub(r'\b\d{10,}(?:\.\d+)?\b', '<TS>', s)
+    s = re.sub(
+        r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b',
+        '<UUID>', s, flags=re.IGNORECASE,
+    )
+    # A printed session id is per-run noise: same cause, different id.
+    s = re.sub(r'\b(session[ _-]?id)\s*[:=]?\s*\S+', r'\1 <ID>', s, flags=re.IGNORECASE)
+    s = re.sub(r'\b[0-9a-f]{64}\b', '<ID>', s, flags=re.IGNORECASE)
+    s = re.sub(r'(?<![\w.:/])/(?:[^\s/]+/)+[^\s,;:)\]}"\']*', '<PATH>', s)
+    return re.sub(r'\s+', ' ', s).strip().lower()
+
+
+def _error_cause_class(error_text: str, worker_output: str = "") -> str:
+    """The worker's own cause line for a synthetic crash label, normalised.
+
+    A crash booked from the exit status alone (``pid N exited with code 1``) says
+    nothing about WHY, so every such crash hashed to one bucket and three
+    unrelated infrastructure refusals were enough to declare the rest of the
+    pass "systemic" (tripping the breaker at one failure each). The worker's last
+    output is already carried alongside the label; its first line is the cause.
+    """
+    if not _SYNTHETIC_CRASH_RE.match(error_text):
+        return ""
+    cause = worker_output or ""
+    if not cause:
+        marker = re.search(r'worker\'s last output:\s*', error_text, re.IGNORECASE)
+        if marker is None:
+            return ""
+        cause = error_text[marker.end():]
+    for raw_line in cause.replace("\\n", "\n").splitlines():
+        line = _normalise_cause_line(raw_line.strip().strip("'\""))
+        if line:
+            return line[:_CAUSE_CLASS_CHARS]
+    return ""
+
+
+def _error_fingerprint(error_text: str, worker_output: str = "") -> str:
+    """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group.
+
+    For a synthetic crash label the worker's cause class is folded in as well:
+    grouping on ``pid n exited with code 1`` alone made every exit-1 crash on the
+    board one "root cause".
+    """
+    fp = _normalise_cause_line(error_text)[:80]
+    cause = _error_cause_class(error_text, worker_output)
+    return f"{fp}|{cause}" if cause else fp
 
 
 # ~96% of "clean exit without a terminal tool call" tasks complete on a later
@@ -1240,21 +1298,33 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     return sweep
 
 
+def _crash_worker_output(dead: _DeadWorker) -> str:
+    """The dead worker's own last output, as carried by its crash payload."""
+    value = (dead.event_payload or {}).get("worker_output")
+    return value if isinstance(value, str) else ""
+
+
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
     Protocol violations get a BOUNDED violation-only budget independent of
     ``consecutive_failures`` (per-task ``max_retries`` takes precedence);
-    systemic same-error crashes (>= 3 identical fingerprints this tick) and
-    terminal provider errors (credential revoked, model gone — a retry cannot
-    heal them) trip immediately.
+    systemic same-cause crashes (>= 3 identical fingerprints this tick, where a
+    plain exit crash's fingerprint carries the worker's own cause class rather
+    than just its exit code) and terminal provider errors (credential revoked,
+    model gone — a retry cannot heal them) trip immediately.
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
+    # One fingerprint per crash, reused for the accounting below: the count and
+    # the lookup it decides must be the same key (and it embeds the worker's own
+    # cause class, which is not in ``error_text`` alone for a plain exit crash).
+    fps: list[str] = []
     for _, _, _, dead in crash_details:
-        fp = _error_fingerprint(dead.error_text)
+        fp = _error_fingerprint(dead.error_text, _crash_worker_output(dead))
+        fps.append(fp)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
-    for tid, pid, claimer, dead in crash_details:
+    for (tid, pid, claimer, dead), fp in zip(crash_details, fps):
         error_text = dead.error_text
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
@@ -1301,7 +1371,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
-            is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+            is_systemic = fp_counts.get(fp, 0) >= 3
             extra = {"pid": pid, "claimer": claimer}
             if is_systemic:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
